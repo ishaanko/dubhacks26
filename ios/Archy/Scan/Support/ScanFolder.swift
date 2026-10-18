@@ -8,7 +8,8 @@ import os
 
 /// On-disk layout for one scan: `Documents/Scans/<timestamp>/{Images/, Checkpoint/, foot.usdz, foot.stl}`.
 /// Images are kept after reconstruction so the scan can be reprocessed on a Mac. The checkpoint
-/// (the biggest part, 300–650 MB) is only needed until the model is built, so it's deleted then.
+/// (the biggest part, 300–650 MB) only helps while the scan's flow runs, so it's deleted once the
+/// model is built or the flow ends.
 nonisolated struct ScanFolder {
     let root: URL
 
@@ -85,11 +86,13 @@ nonisolated struct ScanFolder {
         return files.filter { $0.pathExtension.lowercased() == "heic" }.count
     }
 
-    /// Removes `foot.usdz`, `foot.stl` and the shared zip from an earlier attempt so reprocessing starts clean.
-    func removeOutputs() {
+    /// Removes `foot.usdz`, `foot.stl` and the shared zip from an earlier attempt so reprocessing starts
+    /// clean, and recreates `Checkpoint/` for photogrammetry if it was removed while the photos waited.
+    func prepareForProcessing() {
         for url in [modelURL, stlURL, imagesZipURL] {
             Self.remove(url)
         }
+        try? FileManager.default.createDirectory(at: checkpoint, withIntermediateDirectories: true)
     }
 
     /// Frees the checkpoint once the model has been built.
@@ -100,6 +103,16 @@ nonisolated struct ScanFolder {
 
     func delete() {
         Self.remove(root)
+    }
+
+    /// For a scan nothing can resume any more: drops the checkpoint, or the whole folder when it has
+    /// neither a model nor enough photos to build one. Returns how many bytes that freed.
+    @discardableResult
+    func tidyUp() -> Int64 {
+        if !hasModel && imageCount() < ScanFlowModel.minimumShots {
+            return Self.remove(root)
+        }
+        return Self.remove(checkpoint)
     }
 
     // MARK: - Storage
@@ -127,28 +140,19 @@ nonisolated struct ScanFolder {
         return Double(bytes) / 1_000_000
     }
 
-    /// Run at launch. Removes empty scan folders left by failed starts, checkpoints of scans that
-    /// already have a model, and zips that older builds kept inside scan folders. Photos and models stay.
+    /// Run once at launch, before any scan folder of this launch exists, so no flow can resume anything.
+    /// Tidies every folder (see `tidyUp`) and removes zips that older builds kept inside scan folders.
+    /// Models and photos enough to process stay.
     static func cleanUp() {
         let fileManager = FileManager.default
         let scans = (try? fileManager.contentsOfDirectory(at: scansRoot, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
         var freed: Int64 = 0
-        var emptyFolders = 0
         for root in scans where isDirectory(root) {
-            let folder = ScanFolder(root: root)
-            let hasModel = folder.hasModel
-            if folder.imageCount() == 0 && !hasModel {
-                freed += remove(root)
-                emptyFolders += 1
-                continue
-            }
-            if hasModel {
-                freed += remove(folder.checkpoint)
-            }
+            freed += ScanFolder(root: root).tidyUp()
             freed += remove(root.appending(path: "Images.zip"))
         }
         let free = freeBytes().map(formatted) ?? "unknown"
-        Log.files.notice("Cleanup: removed \(emptyFolders) empty scan folders, freed \(formatted(freed), privacy: .public). Free space: \(free, privacy: .public)")
+        Log.files.notice("Cleanup: freed \(formatted(freed), privacy: .public). Free space: \(free, privacy: .public)")
     }
 
     /// Deletes a file or folder if it exists and returns how many bytes that freed.

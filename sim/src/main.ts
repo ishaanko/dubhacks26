@@ -64,6 +64,8 @@ interface Session {
   own?: OwnScan
   /** Textured version of a bundled scan, for the Realistic toggle. */
   realUrl?: string
+  /** An upload's triangles, kept so the user can say which foot it is. */
+  soup?: Float32Array
 }
 
 interface OwnScan {
@@ -172,6 +174,8 @@ let raf = 0
 let dirty = true
 let rebuild = true
 let pose: FootPose = FLAT_POSE
+/** Bumped by each scan load, session change and Back, so a load that finishes late is dropped instead of taking over. */
+let scanLoad = 0
 const liveFrame = new Float32Array(denseModels.left.grid.nx * denseModels.left.grid.ny)
 
 const canvas = $<HTMLCanvasElement>("view")
@@ -203,6 +207,7 @@ const el = {
   sensors: $<HTMLInputElement>("sensors"), cop: $<HTMLInputElement>("cop"), legendBar: $("legend-bar"), live: $("live"),
   estBox: $("est-box"), estText: $("est-text"), soleNote: $("sole-note"), weightBox: $("weight-box"), weight: $<HTMLInputElement>("weight"),
   scanFile: $<HTMLInputElement>("scan-file"), scanError: $("scan-error"), realBox: $("real-box"), realistic: $<HTMLInputElement>("realistic"),
+  sideBox: $("side-box"), sideNote: $("side-note"),
   recorded: $<HTMLSelectElement>("recorded"), plateStep: $<HTMLSelectElement>("plate-step"), variantBox: $("variant-box"), connectError: $("connect-error"),
 }
 const sections: Record<Screen, HTMLElement> = { watch: $("s-watch"), result: $("s-result"), insole: $("s-insole") }
@@ -412,12 +417,22 @@ function setScreen(next: Screen): void {
 function stopSession(): void {
   unsub?.()
   unsub = null
-  void session?.device?.disconnect()
+  session?.device?.disconnect().catch((e: unknown) => {
+    el.connectError.hidden = false
+    el.connectError.textContent = `Could not disconnect: ${e instanceof Error ? e.message : String(e)}`
+  })
   tracker = liveModel = null
+}
+
+/** Drops any scan load still in flight and clears its status line. */
+function dropScanLoad(): void {
+  scanLoad++
+  el.scanError.hidden = true
 }
 
 function enter(s: Session, model?: PressureModel): void {
   stopSession()
+  dropScanLoad()
   session = s
   position = 0
   playing = s.trial !== null
@@ -434,6 +449,10 @@ function enter(s: Session, model?: PressureModel): void {
   el.showFoot.checked = true
   el.realBox.hidden = !s.realUrl
   el.realistic.checked = false
+  el.sideBox.hidden = !s.soup
+  el.sideNote.hidden = s.own?.result.sideSure ?? true
+  const sideRadio = document.querySelector<HTMLInputElement>(`input[name="scan-side"][value="${s.side}"]`)
+  if (sideRadio) sideRadio.checked = true
   el.variantBox.hidden = !s.variants
   const plateRadio = document.querySelector<HTMLInputElement>('input[name="variant"][value="plate"]')
   if (plateRadio) plateRadio.checked = true
@@ -474,12 +493,20 @@ function enter(s: Session, model?: PressureModel): void {
   view.resize()
 }
 
-/** Runs the same pipeline for an upload and the bundled example: parse, orient, measure, estimate, then the usual flow. */
-function startScan(result: ScanResult, title: string, fileLabel: string, realUrl?: string): void {
+/** Opens a measured scan (upload or bundled): estimate, then the usual flow. */
+function startScan(result: ScanResult, title: string, fileLabel: string, extra: Pick<Session, "realUrl" | "soup"> = {}): void {
   const own = buildOwn(result, Number(el.weight.value) || 70, "before")
   const walk = own.est
   const trial: Trial = { id: "own-scan", label: title, source: "synthetic", side: "left", fs: walk.fs, nFrames: walk.nFrames, sensors: walk.spots, frames: new Float32Array(0) }
-  enter({ title, side: result.side, footKey: "typical", trial, scan: fileLabel, device: null, own, realUrl })
+  enter({ title, side: result.side, footKey: "typical", trial, scan: fileLabel, device: null, own, ...extra })
+}
+
+/** Re-reads an upload as the foot the user picked; picking the guessed foot just confirms it. */
+function pickSide(side: ScanResult["side"]): void {
+  const s = session
+  if (!s?.soup) return
+  el.sideNote.hidden = true
+  if (side !== s.side) startScan(analyzeScan(s.soup, side), s.title, s.scan, { soup: s.soup })
 }
 
 /** Realistic scans by url, loaded on first use (each bundled scan has one transform, so the url is the key). */
@@ -504,36 +531,47 @@ async function showRealistic(on: boolean): Promise<void> {
   invalidate()
 }
 
-async function loadScan(name: string, buf: ArrayBuffer, title: string, realUrl?: string): Promise<void> {
+/** What is known up front about a bundled scan. */
+interface KnownScan {
+  side?: ScanResult["side"]
+  realUrl?: string
+}
+
+/** Reads, measures and opens a scan file from `read`. A known `side` skips the side call; otherwise the triangles are kept
+ *  so the user can change it. A newer load, another session or Back drops this one. */
+async function openScan(name: string, read: () => Promise<ArrayBuffer>, title: string, known: KnownScan = {}): Promise<void> {
+  const load = ++scanLoad
   el.scanError.hidden = false
   el.scanError.classList.remove("err")
-  el.scanError.textContent = "Reading your scan..."
-  await new Promise((r) => setTimeout(r, 30)) // let the message paint before the synchronous measuring
+  el.scanError.textContent = "Loading the scan..."
   try {
-    startScan(analyzeScan(parseScanFile(name, buf)), title, name, realUrl)
-    el.scanError.hidden = true
+    const buf = await read()
+    await new Promise((r) => setTimeout(r, 30)) // let the message paint before the synchronous measuring
+    if (load !== scanLoad) return
+    const soup = parseScanFile(name, buf)
+    startScan(analyzeScan(soup, known.side), title, name, { realUrl: known.realUrl, soup: known.side ? undefined : soup })
   } catch (e) {
+    if (load !== scanLoad) return
     el.scanError.classList.add("err")
     el.scanError.textContent = e instanceof Error ? e.message : String(e)
   }
 }
 
-async function loadScanUrl(url: string, title: string, realUrl?: string): Promise<void> {
-  try {
+const loadScanUrl = (url: string, title: string, known?: KnownScan) =>
+  openScan(url.split("?")[0], async () => {
     const res = await fetch(url)
     if (!res.ok) throw new Error("Could not load the scan.")
-    await loadScan(url.split("?")[0], await res.arrayBuffer(), title, realUrl)
-  } catch (e) {
-    el.scanError.hidden = false
-    el.scanError.classList.add("err")
-    el.scanError.textContent = e instanceof Error ? e.message : String(e)
-  }
-}
-/** Bundled iPhone LiDAR scans, shared with permission (public/models/scan-<key>.stl). */
-const SCANS = { ishaan: "Ishaan's foot", prakhar: "Prakhar's foot", pranav: "Pranav's foot" } as const
+    return res.arrayBuffer()
+  }, title, known)
+/** Bundled iPhone LiDAR scans, shared with permission (public/models/scan-<key>.stl), and which foot each one is. */
+const SCANS = {
+  ishaan: { title: "Ishaan's foot", side: "left" },
+  prakhar: { title: "Prakhar's foot", side: "right" },
+  pranav: { title: "Pranav's foot", side: "right" },
+} as const
 type ScanKey = keyof typeof SCANS
 const loadExampleScan = (key: ScanKey) =>
-  loadScanUrl(`${import.meta.env.BASE_URL}models/scan-${key}.stl`, SCANS[key], `${import.meta.env.BASE_URL}models/scan-${key}-real.glb`)
+  loadScanUrl(`${import.meta.env.BASE_URL}models/scan-${key}.stl`, SCANS[key].title, { side: SCANS[key].side, realUrl: `${import.meta.env.BASE_URL}models/scan-${key}-real.glb` })
 
 function startExample(n: string): void {
   const ex = EXAMPLES.find((e) => e.n === n)
@@ -606,7 +644,7 @@ $("connect").addEventListener("click", async () => {
 document.querySelectorAll<HTMLButtonElement>("[data-scan]").forEach((b) => b.addEventListener("click", () => void loadExampleScan(b.dataset.scan as ScanKey)))
 $("scan-upload").addEventListener("click", () => el.scanFile.click())
 const pickScan = async (file: File | undefined) => {
-  if (file) await loadScan(file.name, await file.arrayBuffer(), "Your foot scan")
+  if (file) await openScan(file.name, () => file.arrayBuffer(), "Your foot scan")
 }
 el.scanFile.addEventListener("change", () => { void pickScan(el.scanFile.files?.[0]); el.scanFile.value = "" })
 const dropZone = $("scan-drop")
@@ -625,6 +663,10 @@ document.querySelectorAll<HTMLInputElement>('input[name="est"]').forEach((r) =>
     rebuild = dirty = true
     invalidate()
   }))
+// Click as well as change, so picking the already-checked (guessed) foot confirms it.
+document.querySelectorAll<HTMLInputElement>('input[name="scan-side"]').forEach((r) => {
+  for (const type of ["click", "change"]) r.addEventListener(type, () => r.checked && pickSide(r.value as ScanResult["side"]))
+})
 el.realistic.addEventListener("change", () => void showRealistic(el.realistic.checked))
 el.weight.addEventListener("change", () => {
   const own = session?.own
@@ -639,6 +681,7 @@ el.weight.addEventListener("change", () => {
 })
 el.back.addEventListener("click", () => {
   stopSession()
+  dropScanLoad()
   session = null
   playing = false
   el.app.hidden = true

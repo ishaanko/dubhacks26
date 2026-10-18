@@ -137,6 +137,13 @@
             <label class="check"><input id="show-foot" type="checkbox" checked /> Show foot</label>
             <label class="check" id="real-box" hidden><input id="realistic" type="checkbox" /> Realistic</label>
           </div>
+          <div id="side-box" class="row" hidden>
+            <fieldset class="seg" aria-label="Which foot?">
+              <label><input type="radio" name="scan-side" value="left" /><span>Left foot</span></label>
+              <label><input type="radio" name="scan-side" value="right" /><span>Right foot</span></label>
+            </fieldset>
+            <p id="side-note" class="note" hidden>We could not tell which foot this is. Pick one.</p>
+          </div>
           <fieldset id="variant-box" class="seg" aria-label="Show" hidden>
             <label><input type="radio" name="variant" value="plate" checked /><span>Clinic plate</span></label>
             <label><input type="radio" name="variant" value="kit" /><span>6-sensor kit</span></label>

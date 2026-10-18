@@ -182,6 +182,7 @@ export class InsoleScene {
 
   private foot: FootModel | null = null
   private footCache = new Map<string, Promise<FootModel>>()
+  private footRequest = 0
   private footVisible = true
   private plainMaterial = new MeshStandardMaterial({ color: 0xc9ccd1, roughness: 0.8 })
   private baseMaterial = new MeshStandardMaterial({ color: 0x3a3a3a, roughness: 0.9 })
@@ -189,15 +190,19 @@ export class InsoleScene {
   private emptyColor: readonly [number, number, number] = [32, 30, 24]
   private plain = false
 
-  /** Shows the scanned foot model at `url` (loads once per url, then swaps instantly). */
+  /** Shows the scanned foot model at `url` (loads once per url, then swaps instantly). A later setFoot or setScanFoot
+   *  wins over a load that is still in flight. */
   async setFoot(url: string): Promise<void> {
+    const request = ++this.footRequest
     let p = this.footCache.get(url)
     if (!p) this.footCache.set(url, (p = FootModel.load(url)))
-    this.useFoot(await p)
+    const next = await p
+    if (request === this.footRequest) this.useFoot(next)
   }
 
   /** Shows the user's own scan (canonical frame) instead of a bundled foot; with `real`, its textured version instead. */
   setScanFoot(positions: Float32Array, indices: Uint32Array, real?: { geo: BufferGeometry; map: Texture }): void {
+    this.footRequest++
     this.useFoot(real ? FootModel.fromTextured(real.geo.clone(), real.map) : FootModel.fromScan(positions, indices))
   }
 

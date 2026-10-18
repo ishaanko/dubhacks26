@@ -50,6 +50,7 @@ export class SandboxScene {
   private marker = new Group()
   private foot: FootModel | null = null
   private footCache = new Map<string, Promise<FootModel>>()
+  private footRequest = 0
   private footVisible = true
   private footRoll = 0
   private raycaster = new Raycaster()
@@ -317,12 +318,13 @@ export class SandboxScene {
     this.marker.children[1].scale.set(1 / p.radius, 1 / p.radius, 1)
   }
 
-  /** Shows the scanned foot at `url` (loaded once per url). */
+  /** Shows the scanned foot at `url` (loaded once per url). A later call wins over a load that is still in flight. */
   async setFoot(url: string): Promise<void> {
+    const request = ++this.footRequest
     let p = this.footCache.get(url)
     if (!p) this.footCache.set(url, (p = FootModel.load(url)))
     const next = await p
-    if (this.foot === next) return
+    if (request !== this.footRequest || this.foot === next) return
     if (this.foot) this.scene.remove(this.foot.mesh)
     this.foot = next
     next.seat(this.insole.heightAt)

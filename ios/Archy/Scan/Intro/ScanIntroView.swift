@@ -10,7 +10,10 @@ struct ScanIntroView: View {
     let onTips: () -> Void
     let onImport: () -> Void
     let onOpen: (SavedScan) -> Void
+    let onProcess: (SavedScan) -> Void
     let onDelete: (SavedScan) -> Void
+    /// Opens scrolled to Previous scans (the `scan.previous` debug route, for screenshots).
+    var startsAtEnd = false
 
     @AppStorage(MeasurementUnit.storageKey) private var unit = MeasurementUnit.localeDefault()
     @State private var pendingDelete: SavedScan?
@@ -22,36 +25,41 @@ struct ScanIntroView: View {
     ]
 
     var body: some View {
-        List {
-            Text("Scan your foot")
-                .display(.hero)
-                .accessibilityAddTraits(.isHeader)
-                .padding(.top, Space.sm)
-                .reveal(0)
-                .introRow()
-            PositioningDiagram()
-                .reveal(1)
-                .introRow()
-            VStack(spacing: 0) {
-                ForEach(Array(Self.tips.enumerated()), id: \.offset) { index, tip in
-                    if index > 0 { Hairline() }
-                    Text(tip)
-                        .foregroundStyle(.ink2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, Space.md)
+        ScrollViewReader { proxy in
+            List {
+                Text("Scan your foot")
+                    .display(.hero)
+                    .accessibilityAddTraits(.isHeader)
+                    .padding(.top, Space.sm)
+                    .reveal(0)
+                    .introRow()
+                PositioningDiagram()
+                    .reveal(1)
+                    .introRow()
+                VStack(spacing: 0) {
+                    ForEach(Array(Self.tips.enumerated()), id: \.offset) { index, tip in
+                        if index > 0 { Hairline() }
+                        Text(tip)
+                            .foregroundStyle(.ink2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, Space.md)
+                    }
                 }
+                .reveal(2)
+                .introRow()
+                previousScans
             }
-            .reveal(2)
-            .introRow()
-            previousScans
+            .onChange(of: previous.count) {
+                if startsAtEnd, let last = previous.last { proxy.scrollTo(last.id, anchor: .bottom) }
+            }
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .safeAreaInset(edge: .bottom) { actions.reveal(3) }
         .confirmationDialog("Delete this scan?", isPresented: deleting, titleVisibility: .visible, presenting: pendingDelete) { scan in
             Button("Delete", role: .destructive) { onDelete(scan) }
-        } message: { _ in
-            Text("Its model and photos are removed from this iPhone.")
+        } message: { scan in
+            Text(scan.unprocessedPhotos == nil ? "Its model and photos are removed from this iPhone." : "Its photos are removed from this iPhone.")
         }
     }
 
@@ -81,9 +89,8 @@ struct ScanIntroView: View {
             .padding(.top, Space.md)
             .introRow()
             ForEach(previous) { scan in
-                Button { onOpen(scan) } label: { row(scan) }
+                previousRow(scan)
                     .buttonStyle(.archyPressable)
-                    .accessibilityIdentifier("scan.previous")
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden, edges: .top)
                     .listRowSeparatorTint(.line2)
@@ -95,15 +102,48 @@ struct ScanIntroView: View {
         }
     }
 
-    /// Date and time, then the length and arch once measured.
-    private func row(_ scan: SavedScan) -> some View {
+    /// A finished scan opens in the viewer; one whose photos were never processed builds its model.
+    @ViewBuilder
+    private func previousRow(_ scan: SavedScan) -> some View {
+        if let photos = scan.unprocessedPhotos {
+            Button { onProcess(scan) } label: { unprocessedRow(scan.date, photos: photos) }
+                .accessibilityIdentifier("scan.process")
+        } else {
+            Button { onOpen(scan) } label: { row(scan) }
+                .accessibilityIdentifier("scan.previous")
+        }
+    }
+
+    private func dateColumn(_ date: Date) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(date.formatted(.dateTime.month(.abbreviated).day().year()))
+            Text(date.formatted(date: .omitted, time: .shortened))
+                .font(.footnote)
+                .foregroundStyle(.inkSecondary)
+        }
+    }
+
+    /// Date and time, the photo count, and Process where a finished scan has its chevron.
+    private func unprocessedRow(_ date: Date, photos: Int) -> some View {
         HStack(spacing: Space.md) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(scan.date.formatted(.dateTime.month(.abbreviated).day().year()))
-                Text(scan.date.formatted(date: .omitted, time: .shortened))
+            dateColumn(date)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("\(photos) photos").monospacedDigit()
+                Text("Not processed")
                     .font(.footnote)
                     .foregroundStyle(.inkSecondary)
             }
+            Text("Process").font(.subheadline.weight(.semibold))
+        }
+        .frame(minHeight: 52)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// Date and time, then the length and arch once measured.
+    private func row(_ scan: SavedScan) -> some View {
+        HStack(spacing: Space.md) {
+            dateColumn(scan.date)
             Spacer()
             if let length = scan.summary?.lengthMM, let isFlat = scan.summary?.isFlat {
                 VStack(alignment: .trailing, spacing: 2) {

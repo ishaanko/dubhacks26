@@ -359,13 +359,18 @@ el.copy.addEventListener("click", async () => {
 if (isSerialSupported()) el.connect.hidden = false
 el.connect.addEventListener("click", async () => {
   if (state.live) {
-    await state.live.disconnect()
-    state.live = state.liveKPa = null
-    el.connect.textContent = "Connect real kit"
-    el.tare.hidden = true
-    el.status.textContent = "Disconnected."
-    updateButtons()
-    invalidate({ ui: true })
+    try {
+      await state.live.disconnect()
+      el.status.textContent = "Disconnected."
+    } catch (err) {
+      el.status.textContent = `Could not disconnect: ${err instanceof Error ? err.message : String(err)}`
+    } finally {
+      state.live = state.liveKPa = null
+      el.connect.textContent = "Connect real kit"
+      el.tare.hidden = true
+      updateButtons()
+      invalidate({ ui: true })
+    }
     return
   }
   try {

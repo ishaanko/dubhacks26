@@ -77,7 +77,7 @@ enum VoiceCache {
 }
 
 @MainActor @Observable
-final class GuidanceVoice {
+final class GuidanceVoice: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
     /// A request budget long enough for a cold xAI render of the longest script.
     private static let patientTimeout: TimeInterval = 12
     nonisolated private static let maxAudioBytes = 2_097_152
@@ -87,9 +87,18 @@ final class GuidanceVoice {
     private let synthesizer = AVSpeechSynthesizer()
     private var player: AVAudioPlayer?
     private var task: Task<Void, Never>?
+    /// The utterance or player now audible, so a late callback from a line that was cut off is ignored.
+    private var line: AnyObject?
     private(set) var status = "On-device voice"
 
-    init() {
+    /// True from the moment a line starts playing until it ends or `stop()` cuts it off.
+    var isSpeaking: Bool { line != nil }
+
+    override init() {
+        super.init()
+        synthesizer.delegate = self
+        NotificationCenter.default.addObserver(self, selector: #selector(interrupted), name: AVAudioSession.interruptionNotification,
+                                               object: AVAudioSession.sharedInstance())
         if !Self.didPurge { Self.didPurge = true; VoiceCache.purgeOldVersions() }
         #if DEBUG
         VoiceConnection.applyLaunchOverrides()
@@ -155,7 +164,27 @@ final class GuidanceVoice {
         }
     }
 
-    func stop() { task?.cancel(); task = nil; player?.stop(); player = nil; synthesizer.stopSpeaking(at: .immediate) }
+    func stop() { task?.cancel(); task = nil; line = nil; player?.stop(); player = nil; synthesizer.stopSpeaking(at: .immediate) }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) { ended(utterance) }
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) { ended(utterance) }
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) { ended(player) }
+    nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: (any Error)?) { ended(player) }
+
+    /// A call or alarm pauses playback with no finish callback, so an interruption ends the line for good.
+    @objc nonisolated private func interrupted(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              AVAudioSession.InterruptionType(rawValue: raw) == .began else { return }
+        Task { @MainActor in self.stop() }
+    }
+
+    /// AVFoundation may call back off the main thread; only the current line clears `isSpeaking`.
+    nonisolated private func ended(_ object: AnyObject) {
+        let id = ObjectIdentifier(object)
+        Task { @MainActor in
+            if let line, ObjectIdentifier(line) == id { self.line = nil }
+        }
+    }
 
     private struct Connection: Sendable { let url: URL; let token: String }
 
@@ -194,8 +223,11 @@ final class GuidanceVoice {
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
             let audio = try AVAudioPlayer(data: bytes)
+            audio.delegate = self
             player = audio
-            return audio.play()
+            guard audio.play() else { return false }
+            line = audio
+            return true
         } catch { return false }
     }
 
@@ -204,6 +236,7 @@ final class GuidanceVoice {
         // Default rate and pitch: the voice quality matters far more than tweaking them.
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = Self.bestLocalVoice()
+        line = utterance
         synthesizer.speak(utterance)
     }
 

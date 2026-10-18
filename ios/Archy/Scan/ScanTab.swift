@@ -5,7 +5,7 @@ import os
 
 /// Scan tab entry point. Rests on the intro; Start opens the camera as a full-screen cover, and
 /// processing, the viewer and failures swap in over the tab as the scan phase advances.
-/// DEBUG routes (`-ArchyRoute`): scan.intro, scan.sample, scan.tips, scan.reconstructing.preview,
+/// DEBUG routes (`-ArchyRoute`): scan.intro, scan.previous, scan.sample, scan.tips, scan.reconstructing.preview,
 /// scan.failed.preview, scan.capture.preview, scan.capture.lap.preview. `-ArchyImportScan <path to .stl or .usdz>`
 /// imports that file and opens it, skipping the picker.
 struct ScanTab: View {
@@ -105,7 +105,9 @@ struct ScanTab: View {
                           onTips: { showingTips = true },
                           onImport: { showingImporter = true },
                           onOpen: openSaved,
-                          onDelete: library.delete)
+                          onProcess: { model.process($0.folder) },
+                          onDelete: library.delete,
+                          startsAtEnd: router.debugRoute == "scan.previous")
         case .reconstructing:
             reconstruction
         case .viewing:

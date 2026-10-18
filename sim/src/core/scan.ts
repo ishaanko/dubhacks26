@@ -18,6 +18,8 @@ export interface ScanResult {
   mesh: TriMesh
   /** Which foot the file contained (the mesh itself is always the left-foot mirror image). */
   side: "left" | "right"
+  /** False when the side cues were too weak or disagreed, so `side` is a guess the user should confirm. */
+  sideSure: boolean
   /** The file's units were scaled by this to get mm (1 = mm, 1000 = meters, 10 = cm). */
   unitScale: number
   /** Affine map from the file's coordinates to the canonical frame, 4x4 column-major (three.js Matrix4 order). Negative
@@ -46,9 +48,9 @@ export interface ScanResult {
   footprint: Indices | null
   /** Insole outline: the foot silhouette near the floor, smoothed and offset outward, counter-clockwise. */
   outline: Point[]
-  /** Heel/toe call: z-spread of the two ends (confidence). Side call: toe-tip lean toward the medial side, mm (or the
-   *  medial minus lateral edge height when the toes are too centered to call). */
-  checks: { heelToeRatio: number; sideMargin: number; ballWiderThanHeel: boolean }
+  /** Heel/toe call: z-spread of the two ends (confidence). Side call cues, mm, > 0 pointing to a left foot: the forefoot
+   *  height difference across the foot (`sideMargin`, decides) and the toe-tip lean (`toeLean`, confirms). */
+  checks: { heelToeRatio: number; sideMargin: number; toeLean: number; ballWiderThanHeel: boolean }
 }
 
 // Butler 2008 AHI cutoffs. Our healthy-cohort scan pipeline reads about 0.37 +/- 0.03, i.e. higher than Butler's
@@ -64,6 +66,9 @@ const OUTLINE_OFFSET = 3
 /** Longest edge above this (mm) marks a hole-fill triangle; real sole scans have about 2 mm triangles. */
 const FILL_EDGE = 5
 const FILL_SHARE_LIMIT = 0.5
+/** A sure side call needs both cues past these, mm (see `orient`). */
+const SIDE_RISE_MM = 4
+const SIDE_LEAN_MM = 3
 
 // ---------- parsing ----------
 
@@ -298,12 +303,13 @@ interface Oriented {
   y: Float64Array
   z: Float64Array
   side: "left" | "right"
+  sideSure: boolean
   mirrored: boolean
   checks: ScanResult["checks"]
 }
 
-/** Floor frame -> canonical frame. See ScanResult for the conventions. */
-function orient(v: Float64Array, up: V3): Oriented {
+/** Floor frame -> canonical frame. See ScanResult for the conventions. A given `side` skips the side call. */
+function orient(v: Float64Array, up: V3, side?: ScanResult["side"]): Oriented {
   const n = v.length / 3
   const e1 = norm(cross(up, Math.abs(up[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0])), e2 = cross(up, e1) // e1 x e2 = up
   const a = new Float64Array(n), b = new Float64Array(n), z = new Float64Array(n)
@@ -351,34 +357,28 @@ function orient(v: Float64Array, up: V3): Oriented {
   const L = s1 - s0
   for (let i = 0; i < n; i++) s[i] -= s0
 
-  // Medial side, first call: the toe tips lean toward the big toe, which is medial. On 38 dataset scans this leaned 9-28 mm
-  // the right way; it also holds for standing phone scans, whose hole-filled sole hides the arch edge used below.
+  // Medial side from two cues, both > 0 when +t is medial. The forefoot height decides; the call is sure only when both cues
+  // clear their noise floor and agree. Neither pointed the wrong way on the 203 scans whose heel and toe were found (the
+  // Schuster dataset plus four phone scans).
+  // 1. The big toe and first metatarsal stand taller than the lateral forefoot: 95th-percentile height of the medial third
+  //    of the width minus the lateral third, at 60-75% of the length. Read 5-17 mm, flat feet and filled soles included.
+  const fore = (i: number) => s[i] >= 0.6 * L && s[i] <= 0.75 * L && z[i] < FOOT_Z
+  const [flo, fhi] = extent(fore, t)
+  const medZ: number[] = [], latZ: number[] = []
+  for (let i = 0; i < n; i++) {
+    if (!fore(i)) continue
+    if (t[i] > fhi - (fhi - flo) / 3) medZ.push(z[i])
+    else if (t[i] < flo + (fhi - flo) / 3) latZ.push(z[i])
+  }
+  const p95 = (zs: number[]) => quantile(Float64Array.from(zs).sort(), 0.95)
+  const rise = p95(medZ) - p95(latZ)
+  // 2. The toe tips lean toward the big toe. Read 6-37 mm, but 1.7 mm on a flat phone scan with straight toes.
   const mid = extent((i) => Math.abs(s[i] - 0.5 * L) < 20 && z[i] < FOOT_Z, t)
   let tip = 0, k = 0
   for (let i = 0; i < n; i++) if (s[i] > 0.94 * L && z[i] < FOOT_Z) (tip += t[i], k++)
   const toeLean = k ? tip / k - (mid[0] + mid[1]) / 2 : 0
-
-  // Fallback when the toes are centered: the arch edge rises off the floor, the lateral edge stays down. Compare the lowest
-  // vertex within 8 mm of each outer edge, per 2 mm row through the midfoot (35-60% of the length).
-  const rows = new Map<number, number[]>()
-  for (let i = 0; i < n; i++) {
-    const r = Math.floor(s[i] / 2)
-    if (s[i] >= 0.35 * L && s[i] <= 0.6 * L) (rows.get(r) ?? rows.set(r, []).get(r)!).push(i)
-  }
-  const edgeP: number[] = [], edgeN: number[] = []
-  for (const idx of rows.values()) {
-    let tmax = -Infinity, tmin = Infinity
-    for (const i of idx) (tmax = Math.max(tmax, t[i]), tmin = Math.min(tmin, t[i]))
-    let hp = Infinity, hn = Infinity
-    for (const i of idx) {
-      if (t[i] > tmax - 8) hp = Math.min(hp, z[i])
-      if (t[i] < tmin + 8) hn = Math.min(hn, z[i])
-    }
-    edgeP.push(hp); edgeN.push(hn)
-  }
-  // > 0: the +t side is medial
-  const sideMargin = Math.abs(toeLean) >= 3 ? toeLean : median(edgeP) - median(edgeN)
-  const medialPositive = sideMargin > 0
+  const sideSure = side !== undefined || (Math.abs(rise) >= SIDE_RISE_MM && Math.abs(toeLean) >= SIDE_LEAN_MM && Math.sign(rise) === Math.sign(toeLean))
+  const medialPositive = side ? side === "left" : rise > 0
   const x = new Float64Array(n)
   // In a right-handed (x, y, z) frame x = y x z = t, so a left foot (medial on +x) keeps t; a right foot is mirrored.
   for (let i = 0; i < n; i++) x[i] = medialPositive ? t[i] : -t[i]
@@ -387,7 +387,10 @@ function orient(v: Float64Array, up: V3): Oriented {
   for (let i = 0; i < n; i++) x[i] -= xc
 
   const ball = widthIn(s, x, z, L, 0.6, 0.78), heel = widthIn(s, x, z, L, 0.08, 0.2)
-  return { x, y: s, z, side: medialPositive ? "left" : "right", mirrored: !medialPositive, checks: { heelToeRatio, sideMargin, ballWiderThanHeel: ball > heel } }
+  return {
+    x, y: s, z, side: medialPositive ? "left" : "right", sideSure, mirrored: !medialPositive,
+    checks: { heelToeRatio, sideMargin: rise, toeLean, ballWiderThanHeel: ball > heel },
+  }
 }
 
 /** Widest 5 mm slab (extent of x) between two fractions of the length, foot vertices only. */
@@ -583,9 +586,10 @@ function medialProfile(m: TriMesh, length: number): { height: number; peakY: num
   return { height: median(prof.map((q) => q[1])), peakY: prof[peak]?.[0] ?? 0.45 * length }
 }
 
-/** Orients a scan (any units, orientation, centering, either foot) into the canonical frame and measures it.
- *  Throws a plain-language Error when the file does not look like a foot. */
-export function analyzeScan(soup: Float32Array): ScanResult {
+/** Orients a scan (any units, orientation, centering, either foot) into the canonical frame and measures it. Pass `side`
+ *  when it is known (a bundled scan, or the user's pick) to skip the side call. Throws a plain-language Error when the
+ *  file does not look like a foot. */
+export function analyzeScan(soup: Float32Array, side?: ScanResult["side"]): ScanResult {
   if (soup.length < 9 * 500) throw new Error("This file has too little geometry to be a foot scan.")
   const unitScale = unitScaleFor(soup)
   const { v, f } = weld(soup, unitScale)
@@ -597,7 +601,7 @@ export function analyzeScan(soup: Float32Array): ScanResult {
   }
   if (volume < 0) for (let t = 0; t < f.length; t += 3) [f[t + 1], f[t + 2]] = [f[t + 2], f[t + 1]]
   const up = refineUp(v, findUp(v, f))
-  const o = orient(v, up)
+  const o = orient(v, up, side)
   const n = v.length / 3
   const positions = new Float32Array(n * 3)
   for (let i = 0; i < n; i++) positions.set([o.x[i], o.y[i], o.z[i]], i * 3)
@@ -626,7 +630,7 @@ export function analyzeScan(soup: Float32Array): ScanResult {
   const footprint = computeIndices({ nx, ny, cell: 1, x0, y0, mask: new Uint8Array(0) }, contact)
 
   return {
-    mesh, side: o.side, unitScale, toCanonical: fitAffine(v, positions, unitScale), length, ballWidth: ball, heelWidth: heel, truncLength: trunc, dorsumHeight: dorsum, ahi,
+    mesh, side: o.side, sideSure: o.sideSure, unitScale, toCanonical: fitAffine(v, positions, unitScale), length, ballWidth: ball, heelWidth: heel, truncLength: trunc, dorsumHeight: dorsum, ahi,
     ahiClass: ahi <= AHI_LOWER ? "lower" : ahi >= AHI_HIGHER ? "higher" : "typical",
     medialArchHeight: profile.height, medialArchY: profile.peakY, soleObserved, fillShare, footprint,
     outline: silhouetteOutline(mesh, length), checks: o.checks,

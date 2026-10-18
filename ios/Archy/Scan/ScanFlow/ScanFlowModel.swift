@@ -210,7 +210,8 @@ final class ScanFlowModel {
     }
 
     /// Back to the idle state (the intro screen) from a result, a failure or a cancelled scan.
-    /// Earlier scans stay on disk.
+    /// The flow is over, so the scan is tidied (`ScanFolder.tidyUp`): its checkpoint goes, and photos
+    /// enough to process stay under Previous scans as not processed.
     func reset() {
         Log.flow.notice("Reset")
         tearDownSession()
@@ -218,6 +219,7 @@ final class ScanFlowModel {
         modelSize = nil
         arch = nil
         canRetryProcessing = false
+        folder?.tidyUp()
         folder = nil
         phase = .ready
     }
@@ -232,12 +234,20 @@ final class ScanFlowModel {
         startReconstruction()
     }
 
+    /// Builds the model for a saved scan whose photos were never processed (Previous scans).
+    func process(_ folder: ScanFolder) {
+        guard session == nil, phase == .ready else { return }
+        Log.flow.notice("Processing saved scan \(folder.root.lastPathComponent, privacy: .public)")
+        self.folder = folder
+        startReconstruction()
+    }
+
     // MARK: - Reconstruction
 
     private func startReconstruction() {
         // One reconstruction at a time: a double-tapped "Try again" must not start a second session on the same folder.
         guard let folder, reconstructor == nil else { return }
-        folder.removeOutputs()
+        folder.prepareForProcessing()
         canRetryProcessing = false
         modelSize = nil
         arch = nil
@@ -253,7 +263,7 @@ final class ScanFlowModel {
                 self.reconstructor = nil
                 phase = .viewing
             } catch is CancellationError {
-                failProcessing("Processing was cancelled. Your photos are still saved.")
+                failProcessing("Processing was cancelled. Your photos are saved under Previous scans.")
             } catch {
                 Log.reconstruction.error("Reconstruction failed: \(String(describing: error), privacy: .public)")
                 failProcessing(describe(error, as: "Building the model failed"))
@@ -371,12 +381,12 @@ final class ScanFlowModel {
         } else {
             Log.capture.error("Session failed: \(String(describing: error), privacy: .public)")
             tearDownSession()
-            // Don't leave an empty folder behind when the session fails before taking any photos.
-            if let folder, folder.imageCount() == 0 {
-                folder.delete()
-                self.folder = nil
-            }
-            fail(describe(error, as: "Capture failed"))
+            // Enough photos to build a model from: offer that, as after a processing failure.
+            // Otherwise `reset()` deletes the folder on the way out.
+            let photos = folder?.imageCount() ?? 0
+            canRetryProcessing = photos >= Self.minimumShots
+            let reason = describe(error, as: "Capture failed")
+            fail(canRetryProcessing ? "\(reason)\n\nTry again to build the model from the \(photos) photos taken." : reason)
         }
     }
 

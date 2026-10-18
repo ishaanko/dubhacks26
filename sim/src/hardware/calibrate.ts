@@ -29,16 +29,20 @@ export interface Calibrator {
   /** Starts a fresh per-sensor max capture (stand on each sensor/foot), applied while `normalize` is on. */
   resetMax(): void
   normalize: boolean
+  /** Full-scale ADC count (1023 on 10-bit boards, 4095 on 12-bit). Safe to change live: tare and peaks are kept in raw counts. */
+  adcMax: number
 }
 
 export function createCalibrator(adcMax: number, count: number): Calibrator {
   let baseline = new Float32Array(count)
+  /** Per-sensor max of raw counts above the baseline. */
   let peaks = new Float32Array(count)
   let tareLeft = 0
   let tareSum = new Float64Array(count)
   let tareTotal = 0
 
   const cal: Calibrator = {
+    adcMax,
     normalize: false,
     tare(frames = 25) {
       tareLeft = tareTotal = frames
@@ -54,9 +58,10 @@ export function createCalibrator(adcMax: number, count: number): Calibrator {
       }
       const out = new Float32Array(count)
       for (let i = 0; i < count; i++) {
-        const kPa = adcToKPa(Math.max(0, raw[i] - baseline[i]), adcMax)
-        if (kPa > peaks[i]) peaks[i] = kPa
-        out[i] = cal.normalize && peaks[i] > 0 ? (kPa / peaks[i]) * NORMALIZED_KPA : kPa
+        const counts = Math.max(0, raw[i] - baseline[i])
+        if (counts > peaks[i]) peaks[i] = counts
+        const kPa = adcToKPa(counts, cal.adcMax)
+        out[i] = cal.normalize && peaks[i] > 0 ? (kPa / adcToKPa(peaks[i], cal.adcMax)) * NORMALIZED_KPA : kPa
       }
       return out
     },

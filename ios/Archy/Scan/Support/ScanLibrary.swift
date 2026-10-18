@@ -2,10 +2,12 @@ import Foundation
 import Observation
 import os
 
-/// One finished scan on disk, as the Scan intro lists it.
+/// One scan on disk, as the Scan intro lists it: a finished model, or photos still to process.
 struct SavedScan: Identifiable {
     let folder: ScanFolder
     let date: Date
+    /// How many photos a scan without a model has, so it can be processed; nil once it has a model.
+    let unprocessedPhotos: Int?
     /// Nil until measured, or when the model file couldn't be read.
     var summary: ScanSummary?
     var id: String { folder.root.lastPathComponent }
@@ -40,7 +42,8 @@ struct OpenedScan {
     let arch: Result<FootArchAnalysis, any Error>
 }
 
-/// The finished scans under `Documents/Scans`, plus opening, importing and deleting them.
+/// The scans under `Documents/Scans` that have a model or enough photos to process, plus opening,
+/// importing and deleting them.
 @MainActor @Observable
 final class ScanLibrary {
     private(set) var scans: [SavedScan] = []
@@ -57,14 +60,19 @@ final class ScanLibrary {
         }
     }
 
-    /// Lists scans newest first right away, then fills in each one's length and arch (cached after the first time).
+    /// Lists scans newest first right away, then fills in each model's length and arch (cached after the first time).
     func reload() async {
         let roots = (try? FileManager.default.contentsOfDirectory(at: ScanFolder.scansRoot, includingPropertiesForKeys: nil)) ?? []
-        scans = roots.map(ScanFolder.init).filter(\.hasModel).map { folder in
-            SavedScan(folder: folder, date: folder.date, summary: Self.cachedSummary(for: folder))
+        scans = roots.map(ScanFolder.init).compactMap { folder in
+            if folder.hasModel {
+                return SavedScan(folder: folder, date: folder.date, unprocessedPhotos: nil, summary: Self.cachedSummary(for: folder))
+            }
+            let photos = folder.imageCount()
+            guard photos >= ScanFlowModel.minimumShots else { return nil }
+            return SavedScan(folder: folder, date: folder.date, unprocessedPhotos: photos)
         }.sorted { $0.date > $1.date }
 
-        for scan in scans where scan.summary == nil {
+        for scan in scans where scan.summary == nil && scan.unprocessedPhotos == nil {
             let folder = scan.folder
             // Off the main actor: reading and measuring a full scan takes a second or more.
             let arch = await Task.detached(priority: .userInitiated) { () -> Result<FootArchAnalysis, any Error>? in
@@ -98,7 +106,7 @@ final class ScanLibrary {
             let opened = try open(folder)
             let summary = ScanSummary(opened.arch)
             Self.cache(summary, for: folder)
-            scans.insert(SavedScan(folder: folder, date: folder.date, summary: summary), at: 0)
+            scans.insert(SavedScan(folder: folder, date: folder.date, unprocessedPhotos: nil, summary: summary), at: 0)
             Log.files.notice("Imported \(url.lastPathComponent, privacy: .public) as \(folder.root.lastPathComponent, privacy: .public)")
             return opened
         } catch {
